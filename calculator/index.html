@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Position Size Calculator - Forex, Futures, Stocks</title>
+<meta name="description" content="Free position size calculator: lots, contracts or shares from your account, risk and stop. Works offline.">
+<meta name="theme-color" content="#0f172a">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Position size calculator</h1>
+  <p class="sub">How many lots, contracts or shares keep the loss at your stop within your risk? Forex, futures and stocks. Free, offline, no sign-up.</p>
+
+  <form class="card grid" autocomplete="off">
+    <label class="wide">Market
+      <select id="type">
+        <option value="forex">Forex (lots)</option>
+        <option value="futures">Futures (contracts)</option>
+        <option value="stocks">Stocks (shares)</option>
+      </select>
+    </label>
+    <label>Account balance
+      <input id="balance" type="number" inputmode="decimal" step="any" min="0" value="10000">
+    </label>
+    <label>Risk per trade (<span id="riskUnit">%</span>)
+      <input id="risk" type="number" inputmode="decimal" step="any" min="0" value="1">
+    </label>
+    <label>Risk is given as
+      <select id="riskMode"><option value="pct">% of balance</option><option value="amt">Amount in account currency</option></select>
+    </label>
+    <label>Stop is given as
+      <select id="stopMode"><option value="price">Entry and stop prices</option><option value="dist">Distance</option></select>
+    </label>
+    <label data-mode="price">Entry price
+      <input id="entry" type="number" inputmode="decimal" step="any" min="0" value="1.1050">
+    </label>
+    <label>Stop <span data-mode="price">price</span><span data-mode="dist">distance</span> <span data-mode="dist">(<span id="stopUnit">pips</span>)</span>
+      <input id="stop" type="number" inputmode="decimal" step="any" min="0" value="1.1000">
+    </label>
+    <label>Target (optional) <span data-mode="price">price</span><span data-mode="dist">distance</span>
+      <input id="target" type="number" inputmode="decimal" step="any" min="0" value="1.1150">
+    </label>
+    <label data-for="forex">Pip size
+      <input id="pipSize" type="number" inputmode="decimal" step="any" min="0" value="0.0001">
+    </label>
+    <label data-for="forex">Pip value per 1.00 lot (account currency)
+      <input id="pipValue" type="number" inputmode="decimal" step="any" min="0" value="10">
+    </label>
+    <label data-for="forex">Lot step
+      <input id="lotStep" type="number" inputmode="decimal" step="any" min="0" value="0.01">
+    </label>
+    <label data-for="futures">Tick size
+      <input id="tickSize" type="number" inputmode="decimal" step="any" min="0" value="0.25">
+    </label>
+    <label data-for="futures">Tick value per contract
+      <input id="tickValue" type="number" inputmode="decimal" step="any" min="0" value="12.5">
+    </label>
+    <p class="sub wide" data-for="forex">Defaults suit USD-quoted pairs such as EURUSD (pip 0.0001, 10 USD per lot). For JPY pairs use pip size 0.01; for other pairs check the pip value with your broker.</p>
+    <p class="sub wide" data-for="futures">Defaults are for E-mini S&amp;P 500 (0.25 = 12.50 USD). Check tick size and value in your contract specification.</p>
+  </form>
+
+  <section class="card" id="result" aria-live="polite">
+    <p class="bad" id="err"></p>
+    <div id="ok">
+      <p class="sub" style="margin:0">Position size</p>
+      <p id="big">-</p>
+      <dl>
+        <dt>Risk at this size</dt><dd id="rRisk">-</dd>
+        <dt>Risk budget</dt><dd id="rBudget">-</dd>
+        <dt>Stop distance</dt><dd id="rStop">-</dd>
+        <dt>Reward : risk</dt><dd id="rRR">-</dd>
+      </dl>
+      <p id="warn"></p>
+    </div>
+  </section>
+
+  <section class="card">
+    <label for="shareUrl">Share these numbers</label>
+    <div class="share">
+      <input id="shareUrl" type="text" readonly>
+      <button id="copy" type="button">Copy link</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <p style="margin-top:0">Want the full tracker with journal and statistics?</p>
+    <a class="btn" data-cta-type="forex" href="https://www.etsy.com/listing/4607858147?utm_source=calculator&amp;utm_medium=pwa&amp;utm_campaign=stopsizer" target="_blank" rel="noopener">Get the full spreadsheet: Forex Lot Size Calculator &amp; Trade Journal</a>
+    <a class="btn" data-cta-type="futures" href="https://www.etsy.com/listing/4607854305?utm_source=calculator&amp;utm_medium=pwa&amp;utm_campaign=stopsizer" target="_blank" rel="noopener" hidden>Get the full spreadsheet: Prop Firm Challenge Control Panel</a>
+    <a class="btn" data-cta-type="stocks" href="https://www.etsy.com/listing/4607878718?utm_source=calculator&amp;utm_medium=pwa&amp;utm_campaign=stopsizer" target="_blank" rel="noopener" hidden>Get the full spreadsheet: Backtest Log &amp; Setup Scorecard</a>
+  </section>
+
+  <footer>
+    <p>Calculation tool only. Not financial advice. No results promised.</p>
+    <p>Built with AI assistance. <a href="https://www.etsy.com/shop/StopSizer" target="_blank" rel="noopener">Stopsizer on Etsy</a></p>
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
