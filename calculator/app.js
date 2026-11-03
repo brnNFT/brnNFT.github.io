@@ -14,10 +14,13 @@ function calc(i) {
   const n = (k) => num(i[k]);
   const fx = i.type === 'forex', fu = i.type === 'futures';
   const pct = i.riskMode !== 'amt';
-  const balance = n('balance'), risk = pct ? balance * n('risk') / 100 : n('risk');
-  if (!(risk > 0) || (pct && !(n('risk') <= 100))) {
-    return { error: pct ? 'Enter a balance above 0 and a risk between 0 and 100%.' : 'Enter a risk amount above 0.' };
+  const balance = n('balance'), r = n('risk');
+  // validate before sizing: negative balance and negative risk must not multiply into a positive budget
+  if (pct ? !(balance > 0 && r > 0 && r <= 100) : !(r > 0 && !(balance < 0) && !(balance > 0 && r > balance))) {
+    return { error: pct ? 'Enter a balance above 0 and a risk between 0 and 100%.'
+      : 'Enter a risk amount above 0 (and not above the balance, if you enter one).' };
   }
+  const risk = pct ? balance * r / 100 : r;
   // unit = price distance of one pip / tick / currency unit; value = money per unit per lot / contract / share
   const unit = fx ? n('pipSize') : fu ? n('tickSize') : 1;
   const value = fx ? n('pipValue') : fu ? n('tickValue') : 1;
@@ -45,23 +48,25 @@ function calc(i) {
   return out;
 }
 
-if (typeof module !== 'undefined') module.exports = { calc, num };
+const FIELDS = ['type', 'balance', 'riskMode', 'risk', 'stopMode', 'entry', 'stop', 'target',
+  'pipSize', 'pipValue', 'lotStep', 'tickSize', 'tickValue'];
+const SHORT = { type: 't', balance: 'b', riskMode: 'rm', risk: 'r', stopMode: 'sm', entry: 'e', stop: 's',
+  target: 'tp', pipSize: 'ps', pipValue: 'pv', lotStep: 'ls', tickSize: 'ts', tickValue: 'tv' };
+// Empty fields are written too ("tp="), so a cleared target is not replaced by the default on the receiving side.
+const toQuery = (v) => new URLSearchParams(FIELDS.map((k) => [SHORT[k], v[k] == null ? '' : String(v[k])])).toString();
+const fromQuery = (qs) => {
+  const q = new URLSearchParams(qs), out = {};
+  FIELDS.forEach((k) => { if (q.has(SHORT[k])) out[k] = q.get(SHORT[k]); });
+  return out;
+};
+
+if (typeof module !== 'undefined') module.exports = { calc, num, toQuery, fromQuery };
 
 if (typeof document !== 'undefined') {
   const $ = (id) => document.getElementById(id);
-  const FIELDS = ['type', 'balance', 'riskMode', 'risk', 'stopMode', 'entry', 'stop', 'target',
-    'pipSize', 'pipValue', 'lotStep', 'tickSize', 'tickValue'];
-  const SHORT = { type: 't', balance: 'b', riskMode: 'rm', risk: 'r', stopMode: 'sm', entry: 'e', stop: 's',
-    target: 'tp', pipSize: 'ps', pipValue: 'pv', lotStep: 'ls', tickSize: 'ts', tickValue: 'tv' };
   const UNIT = { forex: ['pips', 'lots'], futures: ['ticks', 'contracts'], stocks: ['price units', 'shares'] };
   const read = () => Object.fromEntries(FIELDS.map((k) => [k, $(k).value]));
   const fmt = (x, d = 2) => x.toLocaleString('en-US', { maximumFractionDigits: d });
-
-  function shareUrl(v) {
-    const q = new URLSearchParams();
-    FIELDS.forEach((k) => { if (v[k] !== '') q.set(SHORT[k], v[k]); });
-    return location.origin + location.pathname + '?' + q;
-  }
 
   function render() {
     const v = read(), [stepUnit, sizeUnit] = UNIT[v.type] || UNIT.forex;
@@ -74,7 +79,7 @@ if (typeof document !== 'undefined') {
     $('result').classList.toggle('bad', !!r.error);
     $('ok').hidden = !!r.error;
     $('err').textContent = r.error || '';
-    $('shareUrl').value = shareUrl(v);
+    $('shareUrl').value = location.origin + location.pathname + '?' + toQuery(v);
     if (r.error) return;
     $('big').textContent = `${fmt(r.size, 6)} ${r.size === 1 ? sizeUnit.slice(0, -1) : sizeUnit}`;
     $('rRisk').textContent = fmt(r.riskAtSize) + (r.riskPctAtSize ? ` (${fmt(r.riskPctAtSize)}% of balance)` : '');
@@ -84,28 +89,27 @@ if (typeof document !== 'undefined') {
     $('warn').textContent = r.warn || '';
   }
 
-  const q = new URLSearchParams(location.search);
-  FIELDS.forEach((k) => { if (q.has(SHORT[k])) $(k).value = q.get(SHORT[k]); }); // a bad select value just leaves it empty
+  Object.entries(fromQuery(location.search)).forEach(([k, val]) => { $(k).value = val; }); // a bad select value just leaves it empty
   if (!UNIT[$('type').value]) $('type').value = 'forex';
   if (!['pct', 'amt'].includes($('riskMode').value)) $('riskMode').value = 'pct';
   if (!['price', 'dist'].includes($('stopMode').value)) $('stopMode').value = 'price';
   document.querySelector('form').addEventListener('input', render);
   document.querySelector('form').addEventListener('submit', (e) => e.preventDefault());
-  $('copy').addEventListener('click', () => {
-    $('shareUrl').select();
-    try { navigator.clipboard.writeText($('shareUrl').value); } catch (e) { document.execCommand('copy'); }
-    $('copy').textContent = 'Copied';
+  $('copy').addEventListener('click', async () => {
+    const box = $('shareUrl');
+    let ok = false;
+    try { await navigator.clipboard.writeText(box.value); ok = true; } catch (e) {
+      box.select();
+      try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
+    }
+    $('copy').textContent = ok ? 'Copied' : 'Copy failed';
     setTimeout(() => { $('copy').textContent = 'Copy link'; }, 1500);
   });
 
-  // Click count: Cloudflare Web Analytics (injected by Cloudflare, not by this page) has no custom events, so a click
-  // is recorded as a page view of click/<type> through a pushState that is undone at once. No own cookies, no storage.
+  // Click count without touching the history: a GET of the empty static file click/<type>.txt, which shows up in the
+  // host's request statistics (not in Cloudflare Web Analytics, which has no custom events). No cookies, no storage.
   document.querySelectorAll('[data-cta-type]').forEach((a) => a.addEventListener('click', () => {
-    try {
-      const here = location.pathname + location.search;
-      history.pushState(null, '', location.pathname.replace(/[^/]*$/, '') + 'click/' + a.dataset.ctaType);
-      history.replaceState(null, '', here);
-    } catch (e) { /* analytics must never block the link */ }
+    try { fetch('click/' + a.dataset.ctaType + '.txt', { cache: 'no-store', keepalive: true }).catch(() => {}); } catch (e) { /* never block the link */ }
   }));
 
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
