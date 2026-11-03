@@ -1,0 +1,641 @@
+"""Publica um vídeo do Código Cotidiano no YouTube pela Data API v3 (#796): o Breno autoriza uma vez, o Jarvis publica.
+
+Uso, na raiz do Jarvis (passo a passo do Breno: docs/youtube/PUBLICAR-API.md):
+  python docs/youtube/publicar.py ensaio --pasta <pasta> [--publicacao x.json]  sem rede: valida o pacote, plano e cota
+  python docs/youtube/publicar.py conectar-youtube --canal <nome> [--cliente <json do Google Cloud>] [--colar]
+  python docs/youtube/publicar.py publicar --pasta <pasta> --canal <nome> --aprovacao <link do comentário>
+
+O pacote é uma pasta com o vídeo, a legenda SRT, a miniatura, os capítulos, o medidas-v2.json e um publicacao.json
+(modelo: docs/youtube/publicacao.exemplo.json). Os canais ficam em <dados>/publicacoes/canais.json (modelo:
+docs/youtube/canais.exemplo.json); as credenciais, nas variáveis JARVIS_<CRED>_CLIENT_ID/_CLIENT_SECRET/_REFRESH_TOKEN
+do usuário (como o core/respondedor_comentarios.py) e em <dados>/publicacoes/credenciais/<CRED>.json, fora do Git.
+Cada etapa vai para <dados>/publicacoes/<canal>.jsonl: o mesmo arquivo (sha256) nunca sobe duas vezes; o que faltou
+(miniatura, legenda, playlist) é completado na execução seguinte. Sai com 0, ou 1 com o motivo.
+"""
+import argparse
+import base64
+from datetime import datetime, timezone
+import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import struct
+import subprocess
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
+import webbrowser
+
+RAIZ = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(RAIZ))  # roda direto: python docs/youtube/publicar.py
+from core import pasta_dados  # noqa: E402
+from core.maestro_github import REPO, GhError, gh_json  # noqa: E402
+from core.trava import TravaExclusiva  # noqa: E402
+
+API = 'https://www.googleapis.com/youtube/v3'
+UPLOAD = 'https://www.googleapis.com/upload/youtube/v3'
+TOKEN_URL = 'https://oauth2.googleapis.com/token'
+CONSENTIMENTO = 'https://accounts.google.com/o/oauth2/v2/auth'
+ESCOPOS = 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl'
+SUFIXOS = ('CLIENT_ID', 'CLIENT_SECRET', 'REFRESH_TOKEN')
+# Unidades da cota da Data API v3 (10.000 por dia por projeto), conferidas em developers.google.com em 02/11/2026.
+COTA = {'video': 1600, 'miniatura': 50, 'legenda': 400, 'playlist': 50, 'criar_playlist': 50, 'listar': 1}
+COTA_DIA = 10000
+VISIBILIDADES = ('unlisted', 'private', 'public')
+DECLARACAO = 'Narração gerada por IA'
+MAX_TITULO, MAX_DESCRICAO, MAX_TAGS, MAX_MINIATURA = 100, 5000, 500, 2 * 1024 * 1024
+MINIATURA = (1280, 720)
+AVISO_AUDITORIA = ('Aviso: enquanto o projeto do Google Cloud não passar pela auditoria de conformidade da API, o '
+                   'YouTube trava em PRIVADO todo vídeo enviado pela API. O Breno muda a visibilidade no Studio '
+                   '(Conteúdo → Visibilidade), com tudo o mais já preenchido.')
+# Comentário de issue ou PR do Jarvis que registra a aprovação; o publicar confere que ele existe e cita o vídeo.
+REGISTRO_APROVACAO = re.compile(rf'https://github\.com/{re.escape(REPO)}/(?:issues|pull)/(\d+)#issuecomment-(\d+)')
+
+
+class Falha(Exception):
+    """Motivo de parada para o operador: a mensagem já diz o que fazer."""
+
+
+def dados():
+    """data/ da pasta do projeto; numa worktree (sem data/), a pasta real (JARVIS_DADOS), como no produtos/publicar.py."""
+    return RAIZ / 'data' if (RAIZ / 'data').exists() else pasta_dados.destino()
+
+
+# ---- pacote (pasta com o vídeo e o publicacao.json) --------------------------------------------------------------
+
+def ler_capitulos(texto):
+    """[(segundos, 'M:SS', título)] das linhas 'M:SS Título'; erros por linha fora do formato."""
+    capitulos, erros = [], []
+    for linha in texto.splitlines():
+        if not linha.strip():
+            continue
+        achado = re.fullmatch(r'((?:\d+:)?\d{1,2}:\d{2}) +(\S.*)', linha.strip())
+        if not achado:
+            erros.append(f'capítulo fora do formato "M:SS Título": {linha.strip()!r}')
+            continue
+        partes = [int(p) for p in achado.group(1).split(':')]
+        capitulos.append((sum(p * 60 ** i for i, p in enumerate(reversed(partes))), achado.group(1), achado.group(2)))
+    return capitulos, erros
+
+
+def medidas_png(caminho):
+    """(largura, altura) lidas do cabeçalho IHDR; None se não for PNG."""
+    with caminho.open('rb') as arquivo:
+        cabecalho = arquivo.read(24)
+    if cabecalho[:8] != b'\x89PNG\r\n\x1a\n' or cabecalho[12:16] != b'IHDR':
+        return None
+    return struct.unpack('>II', cabecalho[16:24])
+
+
+def ler_pacote(pasta, nome='publicacao.json'):
+    """(pacote, erros) sem rede: o publicacao.json e os arquivos da pasta, com as regras do YouTube conferidas."""
+    pasta = Path(pasta)
+    try:
+        publicacao = json.loads((pasta / nome).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as erro:
+        raise Falha(f'não consegui ler {pasta / nome}: {erro}') from None
+    if not isinstance(publicacao, dict):
+        raise Falha('publicacao.json precisa ser um objeto (modelo: docs/youtube/publicacao.exemplo.json)')
+    erros = []
+
+    def arquivo(chave, obrigatorio=False):
+        nome = publicacao.get(chave)
+        if not nome:
+            if obrigatorio:
+                erros.append(f'publicacao.json sem "{chave}"')
+            return None
+        caminho = pasta / str(nome)
+        if not caminho.is_file() or caminho.resolve().parent != pasta.resolve():  # nada de fora da pasta sobe
+            erros.append(f'{chave}: {nome} não existe na pasta {pasta}')
+            return None
+        return caminho
+
+    pacote = {'pasta': pasta, 'video': arquivo('video', True), 'legenda': arquivo('legenda'),
+              'miniatura': arquivo('miniatura'), 'capitulos': [], 'titulo': str(publicacao.get('titulo') or '').strip(),
+              'descricao': str(publicacao.get('descricao') or '').strip(), 'tags': publicacao.get('tags') or [],
+              'playlist': publicacao.get('playlist', ''), 'visibilidade': publicacao.get('visibilidade'),
+              'publicar_em': publicacao.get('publicar_em')}
+    if pacote['video'] and pacote['video'].suffix.lower() != '.mp4':
+        erros.append(f'video: {pacote["video"].name} não é .mp4')
+    if pacote['legenda'] and pacote['legenda'].suffix.lower() != '.srt':
+        erros.append(f'legenda: {pacote["legenda"].name} não é .srt')
+    if capitulos := arquivo('capitulos'):
+        pacote['capitulos'], problemas = ler_capitulos(capitulos.read_text(encoding='utf-8'))
+        erros += problemas
+        tempos = [segundos for segundos, _, _ in pacote['capitulos']]
+        if not problemas and (len(tempos) < 3 or tempos[0] != 0 or tempos != sorted(set(tempos))):
+            erros.append('capítulos: precisam de pelo menos 3, o primeiro em 0:00 e tempos crescentes')
+        if pacote['capitulos']:
+            pacote['descricao'] += '\n\nCapítulos:\n' + '\n'.join(f'{tempo} {titulo}'
+                                                                  for _, tempo, titulo in pacote['capitulos'])
+    if not pacote['titulo'] or len(pacote['titulo']) > MAX_TITULO:
+        erros.append(f'título com {len(pacote["titulo"])} caracteres (de 1 a {MAX_TITULO})')
+    if not pacote['descricao'].startswith(DECLARACAO):
+        erros.append(f'a descrição precisa começar com "{DECLARACAO}" (declaração de voz sintética)')
+    if len(pacote['descricao']) > MAX_DESCRICAO:
+        erros.append(f'descrição com {len(pacote["descricao"])} caracteres (máximo {MAX_DESCRICAO}, com os capítulos)')
+    if '<' in pacote['descricao'] or '>' in pacote['descricao']:
+        erros.append('a descrição não pode ter < nem > (o YouTube recusa)')
+    if not isinstance(pacote['tags'], list) or not all(isinstance(t, str) and t.strip() for t in pacote['tags']):
+        erros.append('tags: lista de textos')
+    elif sum(len(t) + 2 * (' ' in t) for t in pacote['tags']) > MAX_TAGS:
+        erros.append(f'tags passam de {MAX_TAGS} caracteres somados')
+    if pacote['visibilidade'] not in VISIBILIDADES:
+        erros.append(f'visibilidade {pacote["visibilidade"]!r} (use {", ".join(VISIBILIDADES)})')
+    if pacote['publicar_em']:
+        try:
+            quando = datetime.fromisoformat(str(pacote['publicar_em']).replace('Z', '+00:00'))
+            if quando.tzinfo is None:
+                raise ValueError('sem fuso')
+            if quando <= datetime.now(timezone.utc):
+                erros.append(f'publicar_em {pacote["publicar_em"]} já passou')
+            pacote['publicar_em'] = quando.isoformat()
+        except ValueError:
+            erros.append(f'publicar_em {pacote["publicar_em"]!r} não é ISO 8601 com fuso (ex.: 2026-11-09T15:00:00Z)')
+    if pacote['miniatura']:
+        medidas = medidas_png(pacote['miniatura'])
+        if medidas != MINIATURA or pacote['miniatura'].stat().st_size > MAX_MINIATURA:
+            erros.append(f'miniatura: precisa ser PNG {MINIATURA[0]}x{MINIATURA[1]} até 2 MB '
+                         f'(achei {medidas and "x".join(map(str, medidas))}, '
+                         f'{pacote["miniatura"].stat().st_size // 1024} KB)')
+    if medidas := arquivo('medidas'):
+        try:
+            secoes = json.loads(medidas.read_text(encoding='utf-8'))
+        except ValueError:
+            secoes = {}
+            erros.append(f'{medidas.name} não é JSON')
+        for nome, secao in (secoes.items() if isinstance(secoes, dict) else ()):
+            if isinstance(secao, dict) and str(secao.get('modelo_voz', '')).startswith('eleven') \
+                    and secao.get('plano_elevenlabs', 'free') == 'free':
+                erros.append(f'{medidas.name}: seção {nome} com voz da ElevenLabs no plano free (sem licença '
+                             'comercial); regerar a narração num plano pago')
+    return pacote, erros
+
+
+def corpo_insert(pacote):
+    """Corpo do videos.insert: categoria 27 (Educação), pt-BR, não é para crianças e voz sintética declarada."""
+    status = {'selfDeclaredMadeForKids': False, 'containsSyntheticMedia': True}
+    if pacote['publicar_em']:
+        status.update(privacyStatus='private', publishAt=pacote['publicar_em'])
+    else:
+        status['privacyStatus'] = pacote['visibilidade']
+    return {'snippet': {'title': pacote['titulo'], 'description': pacote['descricao'], 'tags': pacote['tags'],
+                        'categoryId': '27', 'defaultLanguage': 'pt-BR', 'defaultAudioLanguage': 'pt-BR'},
+            'status': status}
+
+
+def etapas_do_pacote(pacote, playlist):
+    return ['video'] + ['miniatura'] * bool(pacote['miniatura']) + ['legenda'] * bool(pacote['legenda']) \
+        + ['playlist'] * bool(playlist)
+
+
+def cota(etapas, criar_playlist=False):
+    total = sum(COTA[etapa] for etapa in etapas)
+    if 'playlist' in etapas:
+        total += COTA['listar'] + COTA['criar_playlist'] * criar_playlist
+    return total
+
+
+def sha256(caminho):
+    soma = hashlib.sha256()
+    with caminho.open('rb') as arquivo:
+        while bloco := arquivo.read(1 << 20):
+            soma.update(bloco)
+    return soma.hexdigest()
+
+
+# ---- canais e credenciais (fora do Git) --------------------------------------------------------------------------
+
+def salvar_json(arquivo, conteudo):
+    arquivo.parent.mkdir(parents=True, exist_ok=True)
+    temporario = arquivo.with_suffix('.tmp')
+    temporario.write_text(json.dumps(conteudo, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporario.replace(arquivo)
+
+
+def canais(pasta):
+    """{nome: canal} de <dados>/publicacoes/canais.json."""
+    arquivo = pasta / 'canais.json'
+    if not arquivo.exists():
+        raise Falha(f'sem {arquivo}: copie docs/youtube/canais.exemplo.json para lá e preencha o canal')
+    try:
+        lista = json.loads(arquivo.read_text(encoding='utf-8')).get('canais', [])
+    except (ValueError, AttributeError):
+        raise Falha(f'{arquivo} não é um objeto JSON com a lista "canais"') from None
+    saida = {str(c.get('nome')): c for c in lista if isinstance(c, dict) and c.get('nome') and c.get('credencial')}
+    if not saida:
+        raise Falha(f'{arquivo}: nenhum canal com "nome" e "credencial"')
+    return saida
+
+
+def canal_de(pasta, nome):
+    todos = canais(pasta)
+    if nome not in todos:
+        raise Falha(f'canal {nome!r} não está em {pasta / "canais.json"} (tenho: {", ".join(todos)})')
+    return todos[nome]
+
+
+def credenciais(credencial, env, pasta):
+    """Variáveis JARVIS_<CRED>_* do ambiente; o que faltar vem do arquivo gravado pelo conectar-youtube."""
+    valores = {s: str(env.get(f'JARVIS_{credencial}_{s}') or '').strip() for s in SUFIXOS}
+    arquivo = pasta / 'credenciais' / f'{credencial}.json'
+    if not all(valores.values()) and arquivo.exists():
+        guardado = json.loads(arquivo.read_text(encoding='utf-8'))
+        valores = {s: valores[s] or str(guardado.get(s) or '') for s in SUFIXOS}
+    return valores
+
+
+def guardar_credenciais(credencial, valores, pasta, setx=subprocess.run):
+    """Arquivo fora do Git (só o dono lê) e, no Windows, as variáveis do usuário. Nunca imprime os valores."""
+    arquivo = pasta / 'credenciais' / f'{credencial}.json'
+    salvar_json(arquivo, valores)
+    os.chmod(arquivo, 0o600)
+    if sys.platform == 'win32':
+        for sufixo, valor in valores.items():
+            setx(['setx', f'JARVIS_{credencial}_{sufixo}', valor], check=True, capture_output=True)
+    return arquivo
+
+
+# ---- YouTube Data API v3 -----------------------------------------------------------------------------------------
+
+def erro_da_api(erro):
+    """(motivo, mensagem) do corpo de erro do Google, sem URL nem token."""
+    try:
+        corpo = json.loads(erro.read(4096).decode('utf-8', 'replace')).get('error') or {}
+        motivo = ((corpo.get('errors') or [{}])[0]).get('reason') or corpo.get('status') or ''
+        return str(motivo), str(corpo.get('message', ''))[:200]
+    except (ValueError, AttributeError):
+        return '', ''
+
+
+class YouTube:
+    """Cliente mínimo: troca o refresh token por um token de 1 h; em 401 renova uma vez; 403 de cota para."""
+
+    def __init__(self, valores, http=urlopen, token=None):
+        self.valores, self.http, self._token = valores, http, token
+
+    def token(self, renovar=False):
+        if renovar or not self._token:
+            resposta, _ = self.pedir(Request(TOKEN_URL, data=urlencode({
+                'client_id': self.valores['CLIENT_ID'], 'client_secret': self.valores['CLIENT_SECRET'],
+                'refresh_token': self.valores['REFRESH_TOKEN'], 'grant_type': 'refresh_token'}).encode()))
+            self._token = resposta['access_token']
+        return self._token
+
+    def pedir(self, requisicao):
+        """(JSON, cabeçalhos) da resposta; toda falha vira Falha com o motivo, sem segredos."""
+        try:
+            with self.http(requisicao, timeout=600) as resposta:
+                return json.loads(resposta.read() or b'{}'), resposta.headers
+        except HTTPError as erro:
+            motivo, mensagem = erro_da_api(erro)
+            caminho = urlparse(requisicao.full_url).path
+            if erro.code == 403 and motivo in ('quotaExceeded', 'dailyLimitExceeded', 'rateLimitExceeded'):
+                raise Falha(f'cota do YouTube esgotada ({motivo}) em {caminho}; as {COTA_DIA} unidades voltam à meia-'
+                            'noite da Califórnia (05:00 em Brasília). O registro guarda o que já subiu; rode de novo '
+                            'amanhã e só o que faltou é feito.') from None
+            raise Falha(f'o YouTube recusou {requisicao.get_method()} {caminho} (HTTP {erro.code} {motivo}): '
+                        f'{mensagem}') from None
+        except (URLError, TimeoutError) as erro:
+            raise Falha(f'sem conexão com o YouTube: {getattr(erro, "reason", erro)}') from None
+
+    def chamar(self, metodo, url, params=None, dados=None, corpo=None, tipo=None, cabecalhos=None):
+        """Chamada autenticada; `dados` vai como JSON, `corpo` (bytes ou arquivo aberto) com o Content-Type `tipo`."""
+        if params:
+            url += '?' + urlencode(params)
+        cab = dict(cabecalhos or {})
+        if dados is not None:
+            corpo, cab['Content-Type'] = json.dumps(dados).encode(), 'application/json; charset=UTF-8'
+        elif tipo:
+            cab['Content-Type'] = tipo
+        for renovar in (False, True):
+            cab['Authorization'] = f'Bearer {self.token(renovar)}'
+            if hasattr(corpo, 'seek'):
+                corpo.seek(0)
+            try:
+                return self.pedir(Request(url, data=corpo, headers=cab, method=metodo))
+            except Falha as falha:
+                if renovar or 'HTTP 401' not in str(falha):
+                    raise
+
+
+def enviar_video(yt, pacote):
+    """videos.insert retomável: abre a sessão com os metadados e envia o arquivo numa chamada, sem carregá-lo na RAM."""
+    # shortcut: um só PUT; se a conexão cair no meio, a execução seguinte sobe de novo (o registro só anota o id no
+    # fim). Trocar por envio em blocos com retomada (Content-Range) quando os vídeos passarem de ~500 MB.
+    tamanho = str(pacote['video'].stat().st_size)
+    _, cabecalhos = yt.chamar('POST', f'{UPLOAD}/videos', {'uploadType': 'resumable', 'part': 'snippet,status'},
+                              dados=corpo_insert(pacote),
+                              cabecalhos={'X-Upload-Content-Type': 'video/mp4', 'X-Upload-Content-Length': tamanho})
+    sessao = cabecalhos.get('Location')
+    if not sessao:
+        raise Falha('o YouTube não devolveu o endereço da sessão de envio (cabeçalho Location)')
+    with pacote['video'].open('rb') as arquivo:
+        resposta, _ = yt.chamar('PUT', sessao, corpo=arquivo, tipo='video/mp4', cabecalhos={'Content-Length': tamanho})
+    if not resposta.get('id'):
+        raise Falha('o envio terminou sem id de vídeo na resposta')
+    return resposta['id']
+
+
+def multipart_related(meta, tipo, conteudo):
+    limite = secrets.token_hex(16)
+    corpo = (f'--{limite}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(meta)}\r\n'
+             f'--{limite}\r\nContent-Type: {tipo}\r\n\r\n').encode() + conteudo + f'\r\n--{limite}--\r\n'.encode()
+    return corpo, f'multipart/related; boundary={limite}'
+
+
+def playlist_id(yt, titulo):
+    """(id, criada) da playlist do canal com esse título; cria pública se não existir."""
+    # shortcut: só as 50 primeiras playlists do canal; paginar quando o canal passar disso.
+    resposta, _ = yt.chamar('GET', f'{API}/playlists', {'part': 'snippet', 'mine': 'true', 'maxResults': 50})
+    for item in resposta.get('items', []):
+        if item.get('snippet', {}).get('title', '').casefold() == titulo.casefold():
+            return item['id'], False
+    criada, _ = yt.chamar('POST', f'{API}/playlists', {'part': 'snippet,status'},
+                          dados={'snippet': {'title': titulo}, 'status': {'privacyStatus': 'public'}})
+    return criada['id'], True
+
+
+# ---- registro e idempotência --------------------------------------------------------------------------------------
+
+def registrar(registro, canal, pacote, soma, etapa, video_id, cota_gasta, **extra):
+    """Uma linha por etapa: quando, qual arquivo (sha256), o id do vídeo e a cota gasta."""
+    registro.parent.mkdir(parents=True, exist_ok=True)
+    with registro.open('a', encoding='utf-8') as saida:
+        saida.write(json.dumps({'quando': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'canal': canal,
+                                'arquivo': pacote['video'].name, 'sha256': soma, 'video_id': video_id, 'etapa': etapa,
+                                'cota': cota_gasta, **extra}, ensure_ascii=False) + '\n')
+
+
+def etapas_feitas(registro, soma):
+    """{etapa: linha} já registradas para este arquivo (sha256)."""
+    feitas = {}
+    if registro.exists():
+        for numero, linha in enumerate(registro.read_text(encoding='utf-8').splitlines(), 1):
+            try:
+                etapa = json.loads(linha)
+            except ValueError:  # para em vez de pular: pular poderia subir de novo o que já subiu
+                raise Falha(f'linha {numero} do registro {registro} está corrompida; conferir antes de publicar') \
+                    from None
+            if etapa.get('sha256') == soma and etapa.get('video_id'):
+                feitas[etapa.get('etapa')] = etapa
+    return feitas
+
+
+# ---- comandos ----------------------------------------------------------------------------------------------------
+
+def plano(pacote, playlist, feitas=()):
+    etapas = etapas_do_pacote(pacote, playlist)
+    status = corpo_insert(pacote)['status']
+    quando = f"programado para {status['publishAt']} (privado até lá)" if 'publishAt' in status \
+        else status['privacyStatus']
+    linhas = [f"[youtube] {pacote['video'].name} ({pacote['video'].stat().st_size // (1 << 20)} MB): {quando}",
+              f"  título ({len(pacote['titulo'])}/{MAX_TITULO}): {pacote['titulo']}",
+              f"  descrição {len(pacote['descricao'])}/{MAX_DESCRICAO} · {len(pacote['tags'])} tags · "
+              f"{len(pacote['capitulos'])} capítulos · categoria 27 Educação · pt-BR · voz sintética declarada",
+              f"  miniatura: {pacote['miniatura'].name if pacote['miniatura'] else 'sem'} · legenda: "
+              f"{pacote['legenda'].name if pacote['legenda'] else 'sem'} · playlist: {playlist or 'sem'}"]
+    pendentes = [e for e in etapas if e not in feitas]
+    custo = cota(pendentes, criar_playlist=True)
+    linhas.append(f"  etapas: {', '.join(etapas)}" + (f" (já feitas: {', '.join(feitas)})" if feitas else ''))
+    linhas.append(f"  cota: até {custo} de {COTA_DIA} unidades/dia (" + ', '.join(
+        f'{e} {COTA[e]}' for e in pendentes) + (' + playlist nova 50 + listar 1' if 'playlist' in pendentes else '')
+        + ')')
+    return '\n'.join(linhas)
+
+
+def ensaio(pasta, canal=None, pasta_dados_=None, nome='publicacao.json'):
+    """Valida o pacote e mostra o plano e a cota, sem rede nem credencial."""
+    pacote, erros = ler_pacote(pasta, nome)
+    playlist = pacote['playlist']
+    if playlist == '' and canal:  # sem a chave no publicacao.json, vale a playlist padrão do canal
+        playlist = canal_de(pasta_dados_ or dados() / 'publicacoes', canal).get('playlist')
+    if pacote['video']:
+        print(plano(pacote, playlist))
+    for erro in erros:
+        print(f'ERRO: {erro}')
+    print('Ensaio sem erros.' if not erros else f'{len(erros)} erro(s): corrigir antes de publicar.')
+    print(AVISO_AUDITORIA)
+    return 1 if erros else 0
+
+
+def comentario_github(numero):
+    """Comentário de issue do Jarvis pelo gh do PC (o repositório é privado)."""
+    try:
+        return gh_json('api', f'repos/{REPO}/issues/comments/{numero}') or {}
+    except (GhError, OSError) as erro:
+        raise Falha(f'não consegui ler o registro da aprovação no GitHub ({erro}); confira o link e o gh') from None
+
+
+def conferir_aprovacao(link, pacote, ler=comentario_github):
+    """O link sozinho não prova nada: o comentário tem de existir nessa issue, ser do Breno e citar este vídeo."""
+    achado = REGISTRO_APROVACAO.fullmatch(str(link or ''))
+    if not achado:
+        raise Falha('publicar exige --aprovacao com o link do comentário da issue que registra a aprovação do Breno '
+                    f'(https://github.com/{REPO}/issues/N#issuecomment-M). Nada foi publicado.')
+    comentario = ler(achado.group(2))
+    corpo = str(comentario.get('body', ''))
+    if not str(comentario.get('issue_url', '')).endswith(f'/issues/{achado.group(1)}') or \
+            'Aprovado pelo Breno' not in corpo or not (pacote['video'].name in corpo or pacote['titulo'] in corpo):
+        raise Falha(f'o comentário {achado.group(0)} não registra a aprovação deste vídeo: ele precisa ser dessa '
+                    f'issue e ter "Aprovado pelo Breno" com o nome do arquivo ({pacote["video"].name}) ou o título')
+    return achado.group(0)
+
+
+def publicar(pasta, canal_nome, aprovacao, pasta_dados_=None, env=None, http=urlopen, ler_comentario=comentario_github,
+             nome='publicacao.json'):
+    pasta_dados_ = pasta_dados_ or dados() / 'publicacoes'
+    pacote, erros = ler_pacote(pasta, nome)
+    if erros:
+        raise Falha('; '.join(erros) + '. Rode o ensaio e corrija o pacote.')
+    link = conferir_aprovacao(aprovacao, pacote, ler_comentario)
+    canal = canal_de(pasta_dados_, canal_nome)
+    valores = credenciais(canal['credencial'], os.environ if env is None else env, pasta_dados_)
+    if not all(valores.values()):
+        raise Falha(f'canal {canal_nome} sem credenciais: o Breno roda uma vez "python docs/youtube/publicar.py '
+                    f'conectar-youtube --canal {canal_nome}" (docs/youtube/PUBLICAR-API.md)')
+    playlist = canal.get('playlist') if pacote['playlist'] == '' else pacote['playlist']
+    trava = TravaExclusiva(pasta_dados_ / 'publicar.lock')  # duas execuções leriam o mesmo registro e subiriam 2x
+    try:
+        trava.acquire(espera=0)
+    except trava.ocupada:
+        raise Falha(f'outra publicação está rodando com a pasta {pasta_dados_}; espere e rode de novo') from None
+    try:
+        return publicar_pacote(pacote, canal_nome, playlist, link, pasta_dados_ / f'{canal_nome}.jsonl',
+                               YouTube(valores, http))
+    finally:
+        trava.release()
+
+
+def publicar_pacote(pacote, canal_nome, playlist, link, registro, yt):
+    soma = sha256(pacote['video'])
+    feitas = etapas_feitas(registro, soma)
+    print(plano(pacote, playlist, feitas))
+    gasto = 0
+
+    def anotar(etapa, video_id, unidades, **extra):
+        nonlocal gasto
+        gasto += unidades
+        registrar(registro, canal_nome, pacote, soma, etapa, video_id, unidades, aprovacao=link, **extra)
+
+    if 'video' in feitas:
+        video_id = feitas['video']['video_id']
+        print(f'[youtube] {pacote["video"].name} já está no canal como {video_id}; não sobe de novo.')
+    else:
+        video_id = enviar_video(yt, pacote)
+        anotar('video', video_id, COTA['video'])
+        print(f'[youtube] vídeo enviado: https://youtu.be/{video_id}')
+    if pacote['miniatura'] and 'miniatura' not in feitas:
+        yt.chamar('POST', f'{UPLOAD}/thumbnails/set', {'videoId': video_id, 'uploadType': 'media'},
+                  corpo=pacote['miniatura'].read_bytes(), tipo='image/png')
+        anotar('miniatura', video_id, COTA['miniatura'])
+        print('[youtube] miniatura definida.')
+    if pacote['legenda'] and 'legenda' not in feitas:
+        corpo, tipo = multipart_related({'snippet': {'videoId': video_id, 'language': 'pt-BR', 'name': 'Português'}},
+                                        'application/octet-stream', pacote['legenda'].read_bytes())
+        yt.chamar('POST', f'{UPLOAD}/captions', {'uploadType': 'multipart', 'part': 'snippet'}, corpo=corpo, tipo=tipo)
+        anotar('legenda', video_id, COTA['legenda'])
+        print('[youtube] legenda pt-BR enviada.')
+    if playlist and 'playlist' not in feitas:
+        lista, criada = playlist_id(yt, playlist)
+        yt.chamar('POST', f'{API}/playlistItems', {'part': 'snippet'}, dados={'snippet': {
+            'playlistId': lista, 'resourceId': {'kind': 'youtube#video', 'videoId': video_id}}})
+        anotar('playlist', video_id, COTA['playlist'] + COTA['listar'] + COTA['criar_playlist'] * criada,
+               playlist_id=lista)
+        print(f'[youtube] na playlist "{playlist}"' + (' (criada agora).' if criada else '.'))
+    print(f'Cota gasta nesta execução: {gasto} de {COTA_DIA} unidades. Registro: {registro}')
+    print(AVISO_AUDITORIA)
+    return 0
+
+
+class _Retorno(BaseHTTPRequestHandler):
+    """Recebe o redirecionamento do Google em http://127.0.0.1:<porta>/ e guarda a query (não a registra no log)."""
+    retorno = None
+
+    def do_GET(self):
+        _Retorno.retorno = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write('Autorização recebida pelo Jarvis. Pode fechar esta aba.'.encode())
+
+    def log_message(self, *args):
+        pass
+
+
+def cliente_oauth(credencial, env, caminho):
+    """client_id e client_secret do ambiente ou do JSON baixado do Google Cloud (nunca do chat)."""
+    valores = {s: str(env.get(f'JARVIS_{credencial}_{s}') or '').strip() for s in SUFIXOS[:2]}
+    if caminho:
+        try:
+            baixado = json.loads(Path(caminho).read_text(encoding='utf-8'))
+            dentro = baixado.get('installed') or baixado.get('web') or baixado
+            valores = {'CLIENT_ID': str(dentro['client_id']), 'CLIENT_SECRET': str(dentro['client_secret'])}
+        except (OSError, ValueError, KeyError, AttributeError) as erro:
+            raise Falha(f'não consegui ler o cliente OAuth em {caminho}: {type(erro).__name__}') from None
+    if not all(valores.values()):
+        raise Falha(f'faltam JARVIS_{credencial}_CLIENT_ID e JARVIS_{credencial}_CLIENT_SECRET no ambiente; ou passe '
+                    '--cliente <client_secret_*.json baixado do Google Cloud> (docs/youtube/PUBLICAR-API.md)')
+    return valores
+
+
+def conectar(canal_nome, cliente=None, colar=False, pasta_dados_=None, env=None, http=urlopen,
+             abrir=webbrowser.open, entrada=input, guardar=guardar_credenciais):
+    """OAuth 2.0 de "App para computador" com PKCE e access_type=offline; o refresh token fica fora do Git.
+
+    Por padrão escuta em http://127.0.0.1:<porta aleatória>/ e recebe o código sozinho; com --colar, o Breno cola o
+    endereço de retorno (o navegador mostra erro de conexão, é o esperado)."""
+    pasta_dados_ = pasta_dados_ or dados() / 'publicacoes'
+    env = os.environ if env is None else env
+    canal = canal_de(pasta_dados_, canal_nome)
+    valores = cliente_oauth(canal['credencial'], env, cliente)
+    verificador, estado = secrets.token_urlsafe(64), secrets.token_urlsafe(16)
+    desafio = base64.urlsafe_b64encode(hashlib.sha256(verificador.encode()).digest()).rstrip(b'=').decode()
+    servidor = None if colar else HTTPServer(('127.0.0.1', 0), _Retorno)
+    redirect = f'http://127.0.0.1:{8765 if colar else servidor.server_address[1]}/'
+    endereco = CONSENTIMENTO + '?' + urlencode({
+        'client_id': valores['CLIENT_ID'], 'redirect_uri': redirect, 'response_type': 'code', 'scope': ESCOPOS,
+        'access_type': 'offline', 'prompt': 'consent', 'state': estado, 'code_challenge': desafio,
+        'code_challenge_method': 'S256'})
+    print(f'1. Entre com a conta Google dona do canal "{canal_nome}" e clique em Permitir (os dois escopos).')
+    print('Se o navegador não abrir, cole este endereço nele:\n' + endereco)
+    abrir(endereco)
+    if colar:
+        print('2. O navegador vai mostrar "não é possível acessar": copie o endereço inteiro da barra.')
+        retorno = {k: v[0] for k, v in parse_qs(urlparse(entrada('3. Cole aqui o endereço e tecle Enter: ')
+                                                         .strip()).query).items()}
+    else:
+        print(f'2. Aguardando o retorno do Google em {redirect} (até 5 min)...')
+        servidor.timeout = 300
+        _Retorno.retorno = None
+        servidor.handle_request()
+        servidor.server_close()
+        retorno = _Retorno.retorno or {}
+    if retorno.get('state') != estado or not retorno.get('code'):
+        raise Falha(f'autorização não concluída ({retorno.get("error", "sem o código desta tentativa")}); rode de novo.')
+    yt = YouTube(valores, http)
+    token, _ = yt.pedir(Request(TOKEN_URL, data=urlencode({
+        'code': retorno['code'], 'client_id': valores['CLIENT_ID'], 'client_secret': valores['CLIENT_SECRET'],
+        'redirect_uri': redirect, 'grant_type': 'authorization_code', 'code_verifier': verificador}).encode()))
+    if not token.get('refresh_token'):
+        raise Falha('o Google não devolveu refresh token: remova o acesso do Jarvis em myaccount.google.com/permissions '
+                    'e rode conectar-youtube de novo.')
+    valores['REFRESH_TOKEN'] = token['refresh_token']
+    arquivo = guardar(canal['credencial'], valores, pasta_dados_)  # antes de qualquer conferência: o consentimento vale
+    print(f'Credencial {canal["credencial"]} gravada em {arquivo}' + (' e nas variáveis do usuário (valem em terminal '
+                                                                     'novo).' if sys.platform == 'win32' else '.'))
+    yt._token = token.get('access_token')
+    try:  # 02/11: a API ainda não ativada no projeto deu 403 accessNotConfigured aqui e jogava fora o consentimento
+        resposta, _ = yt.chamar('GET', f'{API}/channels', {'part': 'id,snippet', 'mine': 'true'})
+    except Falha as falha:
+        print(f'Aviso: não consegui conferir o canal ({falha}). Ative a YouTube Data API v3 no projeto e rode de '
+              'novo, ou preencha o channel_id em canais.json à mão.')
+        return 0
+    itens = resposta.get('items') or []
+    if not itens:
+        raise Falha('a conta que autorizou não tem canal do YouTube; entre com a conta do canal e rode de novo.')
+    if not canal.get('channel_id'):  # preenche o id uma vez; o Breno não precisa procurá-lo
+        config = json.loads((pasta_dados_ / 'canais.json').read_text(encoding='utf-8'))
+        for entrada_canal in config['canais']:
+            if entrada_canal.get('nome') == canal_nome:
+                entrada_canal['channel_id'] = itens[0]['id']
+        salvar_json(pasta_dados_ / 'canais.json', config)
+    print(f'YouTube conectado: canal "{itens[0]["snippet"]["title"]}" ({itens[0]["id"]}).')
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    comandos = parser.add_subparsers(dest='comando', required=True)
+    ensaia = comandos.add_parser('ensaio', help='valida o pacote e mostra o plano e a cota, sem rede')
+    ensaia.add_argument('--pasta', required=True, type=Path)
+    ensaia.add_argument('--canal', help='para mostrar a playlist padrão do canal')
+    ensaia.add_argument('--publicacao', default='publicacao.json', help='outro JSON na pasta (ex.: o do Short)')
+    conecta = comandos.add_parser('conectar-youtube', help='uma vez por canal, pelo Breno: OAuth do Google')
+    conecta.add_argument('--canal', required=True)
+    conecta.add_argument('--cliente', type=Path, help='JSON do cliente OAuth baixado do Google Cloud')
+    conecta.add_argument('--colar', action='store_true', help='colar o endereço de retorno em vez de escutar a porta')
+    publica = comandos.add_parser('publicar', help='publica o pacote aprovado')
+    publica.add_argument('--pasta', required=True, type=Path)
+    publica.add_argument('--canal', required=True)
+    publica.add_argument('--aprovacao', help='link do comentário do GitHub com a aprovação do Breno')
+    publica.add_argument('--publicacao', default='publicacao.json', help='outro JSON na pasta (ex.: o do Short)')
+    args = parser.parse_args(argv)
+    try:
+        if args.comando == 'ensaio':
+            return ensaio(args.pasta, args.canal, nome=args.publicacao)
+        if args.comando == 'publicar':
+            return publicar(args.pasta, args.canal, args.aprovacao, nome=args.publicacao)
+        return conectar(args.canal, args.cliente, args.colar)
+    except Falha as erro:
+        print(f'Parou: {erro}')
+        return 1
+
+
+if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # acentos no console do Windows
+    sys.exit(main())
